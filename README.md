@@ -41,7 +41,7 @@ gh workflow run release.yml -f tag=v0.1.0
 gh run watch --exit-status
 ```
 
-手动触发时，工作流会在当前 `main` 提交上创建对应 tag 和 Release；同一 tag 重跑会覆盖已有资产。
+手动触发时，工作流会在当前 `main` 提交上创建对应 tag 和 Release。Release 资产不可变；若 tag 已存在，必须改用新的版本号。
 
 服务通过 stdio 使用 MCP 协议；数据库密码只保存在进程内存，不写配置、不回显、不记录日志。
 
