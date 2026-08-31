@@ -30,6 +30,19 @@ cargo build --release
 - Windows：`target/release/mysql-mcp.exe`
 - macOS / Linux：`target/release/mysql-mcp`
 
+### GitHub 自动发布
+
+仓库的 `Release` 工作流由 GitHub 托管的 Windows、Linux、macOS runner 编译并上传压缩包与 SHA-256 校验文件，本机不需要预编译或上传二进制。
+
+推送 `v*` 标签会自动发布，也可以使用 GitHub CLI 手动触发：
+
+```bash
+gh workflow run release.yml -f tag=v0.1.0
+gh run watch --exit-status
+```
+
+手动触发时，工作流会在当前 `main` 提交上创建对应 tag 和 Release；同一 tag 重跑会覆盖已有资产。
+
 服务通过 stdio 使用 MCP 协议；数据库密码只保存在进程内存，不写配置、不回显、不记录日志。
 
 服务不从环境变量读取数据库地址或凭据，也没有启动时固定数据源。每次需要新数据库时直接调用 `connect`：
