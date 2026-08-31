@@ -64,9 +64,10 @@ jobs:
           os=$(printf '%s' "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
           arch=$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')
           asset="$BINARY_NAME-$os-$arch.tar.gz"
-          mkdir -p dist/package
-          cp "target/release/$BINARY_NAME" "dist/package/$BINARY_NAME"
-          tar -C dist/package -czf "dist/$asset" "$BINARY_NAME"
+          package_dir="$RUNNER_TEMP/$BINARY_NAME-package"
+          mkdir -p "$package_dir" dist
+          cp "target/release/$BINARY_NAME" "$package_dir/$BINARY_NAME"
+          tar -C "$package_dir" -czf "dist/$asset" "$BINARY_NAME"
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" > "$asset.sha256"
@@ -75,10 +76,10 @@ jobs:
           fi
 
       - name: Upload matrix artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.os }}
-          path: dist/*
+          path: dist/*.*
           if-no-files-found: error
           retention-days: 7
 
