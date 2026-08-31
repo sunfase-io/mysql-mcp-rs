@@ -1,4 +1,8 @@
-use sqlparser::{ast::Statement, dialect::MySqlDialect, parser::Parser};
+use sqlparser::{
+    ast::{Query, SetExpr, Statement},
+    dialect::MySqlDialect,
+    parser::Parser,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
@@ -19,8 +23,11 @@ pub fn classify(sql: &str) -> anyhow::Result<StatementKind> {
     let statement = &statements[0];
     reject_managed_statement(statement)?;
     Ok(match statement {
-        Statement::Query(_)
-        | Statement::ShowFunctions { .. }
+        Statement::Query(query) => {
+            validate_read_query(query)?;
+            StatementKind::Read
+        }
+        Statement::ShowFunctions { .. }
         | Statement::ShowVariable { .. }
         | Statement::ShowStatus { .. }
         | Statement::ShowVariables { .. }
@@ -36,16 +43,17 @@ pub fn classify(sql: &str) -> anyhow::Result<StatementKind> {
         | Statement::ShowViews { .. }
         | Statement::ShowCollation { .. }
         | Statement::ExplainTable { .. } => StatementKind::Read,
-        Statement::Explain {
-            statement,
-            analyze: false,
-            ..
-        } if matches!(statement.as_ref(), Statement::Query(_)) => StatementKind::Read,
+        Statement::Explain { statement, .. } => match statement.as_ref() {
+            Statement::Query(query) => {
+                validate_read_query(query)?;
+                StatementKind::Read
+            }
+            _ => StatementKind::ImplicitCommit,
+        },
         Statement::Insert(_)
         | Statement::Update(_)
         | Statement::Delete(_)
         | Statement::Merge(_)
-        | Statement::Call(_)
         | Statement::LoadData { .. } => StatementKind::Dml,
         _ => StatementKind::ImplicitCommit,
     })
@@ -71,7 +79,44 @@ fn reject_managed_statement(statement: &Statement) -> anyhow::Result<()> {
         Statement::Use(_) => {
             anyhow::bail!("禁止执行 USE；请在 connect 中指定默认库，跨库 SQL 使用 database.table")
         }
+        Statement::Call(_) => {
+            anyhow::bail!("拒绝执行 CALL：存储过程可在内部提交或回滚，无法可靠维护 MCP 事务状态")
+        }
         _ => Ok(()),
+    }
+}
+
+fn validate_read_query(query: &Query) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        query.locks.is_empty(),
+        "query 拒绝 FOR UPDATE/FOR SHARE 等锁定查询；它们需要显式事务语义"
+    );
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            validate_read_query(&cte.query)?;
+        }
+    }
+    validate_read_set_expr(&query.body)
+}
+
+fn validate_read_set_expr(expr: &SetExpr) -> anyhow::Result<()> {
+    match expr {
+        SetExpr::Select(select) => {
+            anyhow::ensure!(
+                select.into.is_none(),
+                "query 拒绝 SELECT INTO；导出文件请使用 query_to_file"
+            );
+            Ok(())
+        }
+        SetExpr::Query(query) => validate_read_query(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            validate_read_set_expr(left)?;
+            validate_read_set_expr(right)
+        }
+        SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
+            anyhow::bail!("query 查询体中包含 DML，拒绝作为只读 SQL 执行")
+        }
     }
 }
 
@@ -119,5 +164,9 @@ mod tests {
         assert!(classify("COMMIT").is_err());
         assert!(classify("SET autocommit = 1").is_err());
         assert!(classify("USE production").is_err());
+        assert!(classify("CALL mutate_and_commit()").is_err());
+        assert!(classify("SELECT * FROM demo FOR UPDATE").is_err());
+        assert!(classify("SELECT * FROM demo FOR SHARE").is_err());
+        assert!(classify("SELECT * FROM demo INTO OUTFILE '/tmp/demo.csv'").is_err());
     }
 }

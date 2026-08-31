@@ -1,12 +1,25 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use mysql_async::{Column, Params, Row, Value as MysqlValue, consts::ColumnType};
 use num_bigint::BigUint;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use std::collections::HashSet;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-pub fn bind_params(params: Option<Vec<Value>>) -> anyhow::Result<Params> {
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ScalarParam {
+    Null(()),
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    String(String),
+}
+
+pub fn bind_params(params: Option<Vec<ScalarParam>>) -> anyhow::Result<Params> {
     let values = params
         .unwrap_or_default()
         .into_iter()
@@ -15,37 +28,32 @@ pub fn bind_params(params: Option<Vec<Value>>) -> anyhow::Result<Params> {
     Ok(Params::Positional(values))
 }
 
-fn bind_value(value: Value) -> anyhow::Result<MysqlValue> {
+fn bind_value(value: ScalarParam) -> anyhow::Result<MysqlValue> {
     Ok(match value {
-        Value::Null => MysqlValue::NULL,
-        Value::Bool(value) => MysqlValue::Int(i64::from(value)),
-        Value::String(value) => MysqlValue::Bytes(value.into_bytes()),
-        Value::Number(value) => {
-            if let Some(unsigned) = value.as_u64() {
-                anyhow::ensure!(
-                    unsigned <= MAX_SAFE_INTEGER,
-                    "数值参数 {unsigned} 超过 JavaScript 安全整数范围，请改用字符串传入"
-                );
-                MysqlValue::UInt(unsigned)
-            } else if let Some(signed) = value.as_i64() {
-                anyhow::ensure!(
-                    signed.unsigned_abs() <= MAX_SAFE_INTEGER,
-                    "数值参数 {signed} 超过 JavaScript 安全整数范围，请改用字符串传入"
-                );
-                MysqlValue::Int(signed)
-            } else if let Some(float) = value.as_f64() {
-                anyhow::ensure!(float.is_finite(), "浮点参数必须是有限值");
-                anyhow::ensure!(
-                    float.fract() != 0.0 || float.abs() <= MAX_SAFE_INTEGER as f64,
-                    "整数数值参数 {float} 超过 JavaScript 安全整数范围，请改用字符串传入"
-                );
-                MysqlValue::Double(float)
-            } else {
-                anyhow::bail!("无法无损解析数值参数 {value}，请改用字符串传入")
-            }
+        ScalarParam::Null(()) => MysqlValue::NULL,
+        ScalarParam::Bool(value) => MysqlValue::Int(i64::from(value)),
+        ScalarParam::String(value) => MysqlValue::Bytes(value.into_bytes()),
+        ScalarParam::Unsigned(value) => {
+            anyhow::ensure!(
+                value <= MAX_SAFE_INTEGER,
+                "数值参数 {value} 超过 JavaScript 安全整数范围，请改用字符串传入"
+            );
+            MysqlValue::UInt(value)
         }
-        Value::Array(_) | Value::Object(_) => {
-            anyhow::bail!("参数只接受 JSON 标量：字符串、数字、布尔值或 null")
+        ScalarParam::Signed(value) => {
+            anyhow::ensure!(
+                value.unsigned_abs() <= MAX_SAFE_INTEGER,
+                "数值参数 {value} 超过 JavaScript 安全整数范围，请改用字符串传入"
+            );
+            MysqlValue::Int(value)
+        }
+        ScalarParam::Float(value) => {
+            anyhow::ensure!(value.is_finite(), "浮点参数必须是有限值");
+            anyhow::ensure!(
+                value.fract() != 0.0 || value.abs() <= MAX_SAFE_INTEGER as f64,
+                "整数数值参数 {value} 超过 JavaScript 安全整数范围，请改用字符串传入"
+            );
+            MysqlValue::Double(value)
         }
     })
 }
@@ -108,7 +116,7 @@ pub fn value_to_json(value: MysqlValue, column: &Column) -> anyhow::Result<Value
         | MYSQL_TYPE_YEAR
         | MYSQL_TYPE_TIMESTAMP2
         | MYSQL_TYPE_DATETIME2
-        | MYSQL_TYPE_TIME2 => temporal_string(value),
+        | MYSQL_TYPE_TIME2 => temporal_string(value, column.column_type()),
         MYSQL_TYPE_JSON | MYSQL_TYPE_ENUM | MYSQL_TYPE_SET => utf8_string(value),
         MYSQL_TYPE_GEOMETRY | MYSQL_TYPE_VECTOR | MYSQL_TYPE_TYPED_ARRAY => binary_object(value),
         MYSQL_TYPE_TINY_BLOB
@@ -196,11 +204,14 @@ fn binary_object(value: MysqlValue) -> anyhow::Result<Value> {
     }
 }
 
-fn temporal_string(value: MysqlValue) -> anyhow::Result<Value> {
+fn temporal_string(value: MysqlValue, column_type: ColumnType) -> anyhow::Result<Value> {
     let text = match value {
         MysqlValue::Date(year, month, day, hour, minute, second, micros) => {
             let date = format!("{year:04}-{month:02}-{day:02}");
-            if hour == 0 && minute == 0 && second == 0 && micros == 0 {
+            if matches!(
+                column_type,
+                ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE
+            ) {
                 date
             } else if micros == 0 {
                 format!("{date} {hour:02}:{minute:02}:{second:02}")
@@ -271,8 +282,35 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_or_composite_parameters() {
-        assert!(bind_params(Some(vec![json!(9_007_199_254_740_992_u64)])).is_err());
-        assert!(bind_params(Some(vec![json!({"x": 1})])).is_err());
+        assert!(bind_params(Some(vec![ScalarParam::Unsigned(9_007_199_254_740_992_u64)])).is_err());
+        assert!(
+            serde_json::from_value::<Vec<ScalarParam>>(json!([{"x": 1}])).is_err(),
+            "对象参数必须在 MCP 参数反序列化阶段失败"
+        );
+    }
+
+    #[test]
+    fn scalar_parameter_schema_exposes_all_json_scalar_types() {
+        let schema = serde_json::to_string(&schemars::schema_for!(ScalarParam)).unwrap();
+        for expected in ["null", "boolean", "integer", "number", "string"] {
+            assert!(
+                schema.contains(expected),
+                "Schema 缺少 {expected}: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_midnight_for_datetime_but_not_date() {
+        let midnight = MysqlValue::Date(2026, 8, 31, 0, 0, 0, 0);
+        assert_eq!(
+            value_to_json(midnight.clone(), &column(ColumnType::MYSQL_TYPE_DATETIME)).unwrap(),
+            json!("2026-08-31 00:00:00")
+        );
+        assert_eq!(
+            value_to_json(midnight, &column(ColumnType::MYSQL_TYPE_DATE)).unwrap(),
+            json!("2026-08-31")
+        );
     }
 
     #[test]

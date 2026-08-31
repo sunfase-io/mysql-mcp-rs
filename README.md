@@ -99,7 +99,7 @@ CC-SWITCH 示例（路径请按本机实际位置修改）：
 
 ## SQL 与事务规则
 
-`query` 只接受解析为只读语句的单条 SQL；`execute` 不接受只读语句。参数使用 MySQL `?` 占位符，只接受 JSON 字符串、数字、布尔值和 `null`。超过 JavaScript 安全整数范围（`2^53 - 1`）的 numeric 参数会失败，请改传十进制字符串；数组和对象会失败。
+`query` 只接受解析为只读语句的单条 SQL；`SELECT ... FOR UPDATE/FOR SHARE`、`SELECT INTO` 等带锁或副作用的查询会被拒绝。`execute` 不接受只读语句，也拒绝事务状态不透明的 `CALL`。参数使用 MySQL `?` 占位符，只接受 JSON 字符串、数字、布尔值和 `null`。超过 JavaScript 安全整数范围（`2^53 - 1`）的 numeric 参数会失败，请改传十进制字符串；数组和对象会失败。
 
 第一条 `INSERT` / `UPDATE` / `DELETE` / `MERGE` 自动开启事务，随后所有 DML 保持未提交。无活动事务时调用 `commit` / `rollback` 会直接失败。活动事务中拒绝可能隐式提交的 DDL/DCL，避免之前的 DML 被意外提交。服务不会在断连后自动重放写操作、提交或任何用户 SQL。
 
@@ -117,6 +117,8 @@ CC-SWITCH 示例（路径请按本机实际位置修改）：
 - 日期时间、枚举、集合、MySQL `JSON` → JSON string；JSON 列不二次解析。
 - 二进制、几何、向量 → `{ "encoding": "base64", "data": "..." }`。
 - 重复列名、未知类型、非法 UTF-8、值与元数据类型不匹配 → 直接失败。
+
+`export_objects` 同时返回 `ddl_sha256`（不含文件末尾换行的 DDL 内容指纹）和 `file_sha256`（实际落盘文件哈希）；兼容字段 `sha256` 等同于 `file_sha256`。
 
 精度验收值：
 

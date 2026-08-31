@@ -1,5 +1,4 @@
 use std::{
-    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -14,17 +13,21 @@ pub struct AtomicTarget {
 }
 
 impl AtomicTarget {
-    pub fn create(path: &str, overwrite: bool) -> anyhow::Result<(Self, File)> {
+    pub async fn create_async(
+        path: &str,
+        overwrite: bool,
+    ) -> anyhow::Result<(Self, tokio::fs::File)> {
         let final_path = PathBuf::from(path);
         anyhow::ensure!(final_path.is_absolute(), "输出路径必须是绝对路径: {path}");
         anyhow::ensure!(
-            overwrite || !final_path.exists(),
+            overwrite || !tokio::fs::try_exists(&final_path).await?,
             "目标文件已存在；如需替换请显式传 overwrite=true: {path}"
         );
         let parent = final_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("输出路径没有父目录: {path}"))?;
-        anyhow::ensure!(parent.is_dir(), "输出目录不存在: {}", parent.display());
+        let metadata = tokio::fs::metadata(parent).await?;
+        anyhow::ensure!(metadata.is_dir(), "输出目录不存在: {}", parent.display());
         let name = final_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -34,10 +37,11 @@ impl AtomicTarget {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let file = OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp_path)?;
+            .open(&temp_path)
+            .await?;
         Ok((
             Self {
                 final_path,
@@ -49,25 +53,26 @@ impl AtomicTarget {
         ))
     }
 
-    pub fn commit(mut self, file: File) -> anyhow::Result<PathBuf> {
-        file.sync_all()?;
+    pub async fn commit_async(mut self, file: tokio::fs::File) -> anyhow::Result<PathBuf> {
+        file.sync_all().await?;
         drop(file);
         if self.overwrite {
-            atomic_replace(&self.temp_path, &self.final_path)?;
+            #[cfg(not(windows))]
+            tokio::fs::rename(&self.temp_path, &self.final_path).await?;
+
+            #[cfg(windows)]
+            {
+                let source = self.temp_path.clone();
+                let target = self.final_path.clone();
+                tokio::task::spawn_blocking(move || atomic_replace(&source, &target)).await??;
+            }
         } else {
-            // 同目录硬链接只会在目标不存在时成功，既原子发布完整文件，也不会在
-            // 检查与提交之间误覆盖并发创建的用户文件。
-            std::fs::hard_link(&self.temp_path, &self.final_path)?;
-            std::fs::remove_file(&self.temp_path)?;
+            tokio::fs::hard_link(&self.temp_path, &self.final_path).await?;
+            tokio::fs::remove_file(&self.temp_path).await?;
         }
         self.committed = true;
         Ok(self.final_path.clone())
     }
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, target)
 }
 
 #[cfg(windows)]
@@ -156,39 +161,44 @@ fn safe_component(label: &str, value: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
-    #[test]
-    fn atomic_target_does_not_overwrite_by_default() {
+    #[tokio::test]
+    async fn atomic_target_does_not_overwrite_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.jsonl");
-        std::fs::write(&path, "old").unwrap();
-        assert!(AtomicTarget::create(path.to_str().unwrap(), false).is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+        tokio::fs::write(&path, "old").await.unwrap();
+        assert!(
+            AtomicTarget::create_async(path.to_str().unwrap(), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "old");
     }
 
-    #[test]
-    fn atomic_target_publishes_complete_file() {
-        use std::io::Write;
-
+    #[tokio::test]
+    async fn atomic_target_publishes_complete_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.jsonl");
-        let (target, mut file) = AtomicTarget::create(path.to_str().unwrap(), false).unwrap();
-        file.write_all(b"{\"id\":1}\n").unwrap();
-        target.commit(file).unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), b"{\"id\":1}\n");
+        let (target, mut file) = AtomicTarget::create_async(path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+        file.write_all(b"{\"id\":1}\n").await.unwrap();
+        target.commit_async(file).await.unwrap();
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"{\"id\":1}\n");
     }
 
-    #[test]
-    fn atomic_target_replaces_only_when_explicitly_allowed() {
-        use std::io::Write;
-
+    #[tokio::test]
+    async fn atomic_target_replaces_only_when_explicitly_allowed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.csv");
-        std::fs::write(&path, b"old").unwrap();
-        let (target, mut file) = AtomicTarget::create(path.to_str().unwrap(), true).unwrap();
-        file.write_all(b"new").unwrap();
-        target.commit(file).unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), b"new");
+        tokio::fs::write(&path, b"old").await.unwrap();
+        let (target, mut file) = AtomicTarget::create_async(path.to_str().unwrap(), true)
+            .await
+            .unwrap();
+        file.write_all(b"new").await.unwrap();
+        target.commit_async(file).await.unwrap();
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"new");
     }
 
     #[test]

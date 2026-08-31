@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { createInterface as createPrompt } from 'node:readline/promises';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -114,6 +115,12 @@ try {
   for (const name of expectedTools) {
     if (!listed.tools.some((entry) => entry.name === name)) throw new Error(`缺少 MCP 工具 ${name}`);
   }
+  const querySchema = JSON.stringify(listed.tools.find((entry) => entry.name === 'query')?.inputSchema);
+  for (const scalarType of ['null', 'boolean', 'integer', 'number', 'string']) {
+    if (!querySchema.includes(`"${scalarType}"`)) {
+      throw new Error(`query params Schema 缺少 JSON 标量类型 ${scalarType}: ${querySchema}`);
+    }
+  }
 
   const connect = await tool('connect', {
     host,
@@ -143,10 +150,11 @@ try {
     sql: 'INSERT INTO mcp_integration(id, txt, amount, nullable_col) VALUES (?, ?, ?, ?)',
     params: ['18446744073709551615', '中文', '12345678901234567890.123456', null],
   });
-  await tool('execute', {
+  const ddlRejected = await tool('execute', {
     connection_id: connectionId,
     sql: 'CREATE TEMPORARY TABLE mcp_must_not_exist (id INT)',
   }, true);
+  equal(ddlRejected._db.connection_id, connectionId, 'DDL rejection database identity');
   await tool('rollback', { connection_id: connectionId });
   let result = await tool('query', {
     connection_id: connectionId,
@@ -163,7 +171,8 @@ try {
     ],
   });
   await tool('commit', { connection_id: connectionId });
-  await tool('commit', { connection_id: connectionId }, true);
+  const duplicateCommit = await tool('commit', { connection_id: connectionId }, true);
+  equal(duplicateCommit._db.connection_id, connectionId, 'commit error database identity');
 
   result = await tool('query', {
     connection_id: connectionId,
@@ -173,6 +182,34 @@ try {
   equal(result.rows[1].id, '18446744073709551615', 'unsigned max precision');
   equal(result.rows[1].amount, '12345678901234567890.123456', 'decimal precision');
   equal(result.rows[0].nullable_col, null, 'NULL mapping');
+
+  const temporal = await tool('query', {
+    connection_id: connectionId,
+    sql: "SELECT CAST('2026-08-31 00:00:00' AS DATETIME) AS midnight_datetime, CAST('2026-08-31' AS DATE) AS date_only",
+  });
+  equal(temporal.rows[0].midnight_datetime, '2026-08-31 00:00:00', 'midnight DATETIME');
+  equal(temporal.rows[0].date_only, '2026-08-31', 'DATE formatting');
+
+  const lockingRead = await tool('query', {
+    connection_id: connectionId,
+    sql: 'SELECT id FROM mcp_integration FOR UPDATE',
+  }, true);
+  if (!/锁定查询/.test(lockingRead.error)) throw new Error(`未拒绝锁定查询: ${lockingRead.error}`);
+  equal(lockingRead._db.connection_id, connectionId, 'locking query error database identity');
+
+  const selectInto = await tool('query', {
+    connection_id: connectionId,
+    sql: "SELECT id FROM mcp_integration INTO OUTFILE '/tmp/mcp-must-not-write.csv'",
+  }, true);
+  if (!/SELECT INTO|SQL 解析失败/.test(selectInto.error)) {
+    throw new Error(`未拒绝 SELECT INTO: ${selectInto.error}`);
+  }
+
+  const call = await tool('execute', {
+    connection_id: connectionId,
+    sql: 'CALL mcp_must_not_execute()',
+  }, true);
+  if (!/拒绝执行 CALL/.test(call.error)) throw new Error(`未拒绝 CALL: ${call.error}`);
 
   const rowTruncated = await tool('query', {
     connection_id: connectionId,
@@ -217,11 +254,12 @@ try {
   });
   equal(result.rows[0].count, '0', 'savepoint rollback');
 
-  await tool('query', {
+  const timedOut = await tool('query', {
     connection_id: connectionId,
     sql: 'SELECT SLEEP(3) AS slept',
     timeout_secs: 1,
   }, true);
+  equal(timedOut._db.connection_id, connectionId, 'timeout error database identity');
   result = await tool('query', { connection_id: connectionId, sql: 'SELECT 1 AS alive' });
   equal(result.rows[0].alive, '1', 'connection reuse after timeout');
 
@@ -231,7 +269,8 @@ try {
   }, true);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
   await tool('cancel_statement', { connection_id: connectionId });
-  await slowQuery;
+  const cancelledQuery = await slowQuery;
+  equal(cancelledQuery._db.connection_id, connectionId, 'cancel error database identity');
   result = await tool('query', { connection_id: connectionId, sql: 'SELECT 2 AS alive' });
   equal(result.rows[0].alive, '2', 'connection reuse after manual cancellation');
 
@@ -282,7 +321,7 @@ try {
       type: firstTable.object_type,
       name: firstTable.object_name,
     };
-    await tool('get_object_ddl', object);
+    const ddl = await tool('get_object_ddl', object);
     await tool('object_fingerprint', object);
     const archive = await tool('export_objects', {
       connection_id: connectionId,
@@ -290,6 +329,12 @@ try {
       objects: [{ database: object.database, type: object.type, name: object.name }],
     });
     equal(archive.items[0].ok, true, 'object archive');
+    const archiveItem = archive.items[0];
+    const fileHash = createHash('sha256').update(readFileSync(archiveItem.path)).digest('hex');
+    const ddlHash = createHash('sha256').update(ddl.ddl).digest('hex');
+    equal(archiveItem.file_sha256, fileHash, 'object archive file hash');
+    equal(archiveItem.sha256, fileHash, 'object archive compatibility hash');
+    equal(archiveItem.ddl_sha256, ddlHash, 'object archive DDL hash');
   }
 
   await tool('disconnect', { connection_id: connectionId });

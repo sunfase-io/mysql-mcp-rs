@@ -3,7 +3,7 @@ use crate::{
     files::{AtomicTarget, export_path, validate_export_paths},
     objects::{ObjectRef, find_ddl, normalize_type, show_create_sql},
     sql::{self, StatementKind},
-    values::{bind_params, column_names, row_to_json},
+    values::{ScalarParam, bind_params, column_names, row_to_json},
 };
 use mysql_async::prelude::Queryable;
 use rmcp::{
@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -26,6 +25,7 @@ use std::{
     },
     time::Instant,
 };
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 const DEFAULT_MAX_ROWS: usize = 200;
 const DEFAULT_MAX_BYTES: usize = 32 * 1024;
@@ -76,7 +76,7 @@ pub struct RequiredConnectionArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryArgs {
     pub sql: String,
-    pub params: Option<Vec<Value>>,
+    pub params: Option<Vec<ScalarParam>>,
     pub max_rows: Option<usize>,
     pub max_bytes: Option<usize>,
     pub timeout_secs: Option<u64>,
@@ -86,7 +86,7 @@ pub struct QueryArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteArgs {
     pub sql: String,
-    pub params: Option<Vec<Value>>,
+    pub params: Option<Vec<ScalarParam>>,
     pub timeout_secs: Option<u64>,
     pub connection_id: Option<String>,
 }
@@ -94,7 +94,7 @@ pub struct ExecuteArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteManyArgs {
     pub sql: String,
-    pub params_list: Vec<Vec<Value>>,
+    pub params_list: Vec<Vec<ScalarParam>>,
     pub timeout_secs: Option<u64>,
     pub connection_id: Option<String>,
 }
@@ -102,7 +102,7 @@ pub struct ExecuteManyArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryToFileArgs {
     pub sql: String,
-    pub params: Option<Vec<Value>>,
+    pub params: Option<Vec<ScalarParam>>,
     pub path: String,
     #[serde(default = "default_file_format")]
     pub format: String,
@@ -268,6 +268,37 @@ struct QueryData {
 }
 
 impl MysqlMcp {
+    async fn complete_tool_result(
+        &self,
+        result: anyhow::Result<Value>,
+        connection_id: Option<&str>,
+    ) -> CallToolResult {
+        match result {
+            Ok(value) => tool_ok(value),
+            Err(error) => self.tool_error_with_db(error, connection_id).await,
+        }
+    }
+
+    async fn tool_error_with_db(
+        &self,
+        error: impl std::fmt::Display,
+        connection_id: Option<&str>,
+    ) -> CallToolResult {
+        let body = json!({
+            "ok": false,
+            "error": error.to_string(),
+        });
+        if let Ok(session) = self.sessions.get(connection_id).await {
+            let state = session.state.lock().await;
+            return CallToolResult::structured_error(add_db(
+                body,
+                &state.identity,
+                ReconnectNotice::default(),
+            ));
+        }
+        tool_error(error)
+    }
+
     async fn run_query(&self, args: QueryArgs, enforce_read: bool) -> anyhow::Result<Value> {
         if enforce_read {
             sql::require_read(&args.sql)?;
@@ -354,7 +385,7 @@ impl MysqlMcp {
                     sql,
                     params: None,
                     max_rows: Some(1),
-                    max_bytes: Some(16 * 1024 * 1024),
+                    max_bytes: Some(usize::MAX),
                     timeout_secs: None,
                     connection_id,
                 },
@@ -398,18 +429,19 @@ fn limit_reason(
 impl MysqlMcp {
     #[tool(description = "连接 MySQL；密码仅保存在进程内存中，重复 connection_id 会失败")]
     async fn connect(&self, Parameters(args): Parameters<ConnectArgs>) -> CallToolResult {
+        let connection_id = args
+            .connection_id
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}/{}", args.host, args.port, args.database));
         let result = async {
             anyhow::ensure!(!args.host.trim().is_empty(), "host 不能为空");
             anyhow::ensure!(args.port > 0, "port 必须大于 0");
             anyhow::ensure!(!args.user.trim().is_empty(), "user 不能为空");
             anyhow::ensure!(!args.database.trim().is_empty(), "database 不能为空");
-            let id = args
-                .connection_id
-                .unwrap_or_else(|| format!("{}:{}/{}", args.host, args.port, args.database));
             let session = self
                 .sessions
                 .connect(
-                    id,
+                    connection_id.clone(),
                     ConnectionConfig {
                         host: args.host,
                         port: args.port,
@@ -427,7 +459,8 @@ impl MysqlMcp {
             ))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, Some(&connection_id))
+            .await
     }
 
     #[tool(description = "列出进程内的 MySQL 连接及事务状态")]
@@ -472,7 +505,10 @@ impl MysqlMcp {
                     ReconnectNotice::default(),
                 ))
             }
-            Err(error) => tool_error(error),
+            Err(error) => {
+                self.tool_error_with_db(error, Some(&args.connection_id))
+                    .await
+            }
         }
     }
 
@@ -481,6 +517,7 @@ impl MysqlMcp {
         &self,
         Parameters(args): Parameters<RequiredConnectionArgs>,
     ) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = async {
             let session = self.sessions.get(Some(&args.connection_id)).await?;
             let mut state = session.state.lock().await;
@@ -501,7 +538,8 @@ impl MysqlMcp {
             ))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, Some(&connection_id))
+            .await
     }
 
     #[tool(description = "通过独立控制连接执行 KILL QUERY，保留原会话和可保留的事务")]
@@ -509,6 +547,7 @@ impl MysqlMcp {
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = async {
             let session = self.sessions.get(args.connection_id.as_deref()).await?;
             let thread_id = session.cancel().await?;
@@ -520,19 +559,21 @@ impl MysqlMcp {
             ))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "执行一条只读 SQL，按行数和字节数双重限制返回并排空剩余结果")]
     async fn query(&self, Parameters(args): Parameters<QueryArgs>) -> CallToolResult {
-        self.run_query(args, true)
+        let connection_id = args.connection_id.clone();
+        let result = self.run_query(args, true).await;
+        self.complete_tool_result(result, connection_id.as_deref())
             .await
-            .map(tool_ok)
-            .unwrap_or_else(tool_error)
     }
 
     #[tool(description = "执行一条 DML/DDL/DCL；首条 DML 自动开启事务，DDL 隐式提交需显式确认")]
     async fn execute(&self, Parameters(args): Parameters<ExecuteArgs>) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = async {
             let kind = sql::classify(&args.sql)?;
             anyhow::ensure!(kind != StatementKind::Read, "只读 SQL 请使用 query");
@@ -585,11 +626,13 @@ impl MysqlMcp {
             ))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "预编译一次 DML 并执行多组参数；以保存点保证本批原子性")]
     async fn execute_many(&self, Parameters(args): Parameters<ExecuteManyArgs>) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = async {
             sql::require_dml(&args.sql)?;
             anyhow::ensure!(!args.params_list.is_empty(), "params_list 不能为空");
@@ -686,7 +729,10 @@ impl MysqlMcp {
         match result {
             Ok(value) if value["ok"] == json!(false) => CallToolResult::structured_error(value),
             Ok(value) => tool_ok(value),
-            Err(error) => tool_error(error),
+            Err(error) => {
+                self.tool_error_with_db(error, connection_id.as_deref())
+                    .await
+            }
         }
     }
 
@@ -702,15 +748,16 @@ impl MysqlMcp {
 
     #[tool(description = "将只读查询流式写入绝对路径 JSONL/CSV，正文不进入 MCP 返回体")]
     async fn query_to_file(&self, Parameters(args): Parameters<QueryToFileArgs>) -> CallToolResult {
-        self.run_query_to_file(args)
+        let connection_id = args.connection_id.clone();
+        let result = self.run_query_to_file(args).await;
+        self.complete_tool_result(result, connection_id.as_deref())
             .await
-            .map(tool_ok)
-            .unwrap_or_else(tool_error)
     }
 
     #[tool(description = "列出可见数据库")]
     async fn list_databases(&self, Parameters(args): Parameters<ConnectionArgs>) -> CallToolResult {
-        self.run_query(
+        let connection_id = args.connection_id.clone();
+        let result = self.run_query(
             QueryArgs {
                 sql: "SELECT SCHEMA_NAME AS database_name, DEFAULT_CHARACTER_SET_NAME AS default_character_set, DEFAULT_COLLATION_NAME AS default_collation FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME".to_owned(),
                 params: None,
@@ -720,24 +767,31 @@ impl MysqlMcp {
                 connection_id: args.connection_id,
             },
             true,
-        ).await.map(tool_ok).unwrap_or_else(tool_error)
+        ).await;
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "列出数据库中的表和视图")]
     async fn list_tables(&self, Parameters(args): Parameters<ListTablesArgs>) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let params = vec![
             args.database
                 .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-            args.database.map(Value::String).unwrap_or(Value::Null),
+                .map(ScalarParam::String)
+                .unwrap_or(ScalarParam::Null(())),
+            args.database
+                .map(ScalarParam::String)
+                .unwrap_or(ScalarParam::Null(())),
             args.name_like
                 .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-            args.name_like.map(Value::String).unwrap_or(Value::Null),
+                .map(ScalarParam::String)
+                .unwrap_or(ScalarParam::Null(())),
+            args.name_like
+                .map(ScalarParam::String)
+                .unwrap_or(ScalarParam::Null(())),
         ];
-        self.run_query(
+        let result = self.run_query(
             QueryArgs {
                 sql: "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS table_name, TABLE_TYPE AS table_type, ENGINE AS engine, TABLE_ROWS AS estimated_rows FROM information_schema.TABLES WHERE (? IS NULL OR TABLE_SCHEMA = ?) AND (? IS NULL OR TABLE_NAME LIKE ?) ORDER BY TABLE_SCHEMA, TABLE_NAME".to_owned(),
                 params: Some(params),
@@ -747,7 +801,9 @@ impl MysqlMcp {
                 connection_id: args.connection_id,
             },
             true,
-        ).await.map(tool_ok).unwrap_or_else(tool_error)
+        ).await;
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "描述表字段、类型、默认值、键和扩展属性")]
@@ -755,27 +811,36 @@ impl MysqlMcp {
         &self,
         Parameters(args): Parameters<DescribeTableArgs>,
     ) -> CallToolResult {
-        self.run_query(
+        let connection_id = args.connection_id.clone();
+        let result = self.run_query(
             QueryArgs {
                 sql: "SELECT ORDINAL_POSITION AS ordinal_position, COLUMN_NAME AS column_name, COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, COLUMN_KEY AS column_key, EXTRA AS extra, COLUMN_COMMENT AS column_comment FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION".to_owned(),
-                params: Some(vec![Value::String(args.database), Value::String(args.table)]),
+                params: Some(vec![
+                    ScalarParam::String(args.database),
+                    ScalarParam::String(args.table),
+                ]),
                 max_rows: Some(10_000),
                 max_bytes: Some(4 * 1024 * 1024),
                 timeout_secs: None,
                 connection_id: args.connection_id,
             },
             true,
-        ).await.map(tool_ok).unwrap_or_else(tool_error)
+        ).await;
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "列出 TABLE/VIEW/PROCEDURE/FUNCTION/TRIGGER/EVENT 对象")]
     async fn list_objects(&self, Parameters(args): Parameters<ListObjectsArgs>) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = self.build_list_objects(args).await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "取得 TABLE/VIEW/PROCEDURE/FUNCTION/TRIGGER/EVENT 的 SHOW CREATE DDL")]
     async fn get_object_ddl(&self, Parameters(args): Parameters<ObjectArgs>) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = async {
             let object = ObjectRef::from(&args);
             let (ddl, identity, notice) = self.fetch_ddl(&object, args.connection_id).await?;
@@ -786,11 +851,13 @@ impl MysqlMcp {
             ))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "计算对象 DDL 的 SHA-256 指纹")]
     async fn object_fingerprint(&self, Parameters(args): Parameters<ObjectArgs>) -> CallToolResult {
+        let connection_id = args.connection_id.clone();
         let result = async {
             let object = ObjectRef::from(&args);
             let (ddl, identity, notice) = self.fetch_ddl(&object, args.connection_id).await?;
@@ -806,7 +873,8 @@ impl MysqlMcp {
             ))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, connection_id.as_deref())
+            .await
     }
 
     #[tool(description = "按数据库/对象类型目录批量归档 DDL；单项失败不影响其他项")]
@@ -814,10 +882,10 @@ impl MysqlMcp {
         &self,
         Parameters(args): Parameters<ExportObjectsArgs>,
     ) -> CallToolResult {
-        self.run_export_objects(args)
+        let connection_id = args.connection_id.clone();
+        let result = self.run_export_objects(args).await;
+        self.complete_tool_result(result, connection_id.as_deref())
             .await
-            .map(tool_ok)
-            .unwrap_or_else(tool_error)
     }
 }
 
@@ -827,6 +895,7 @@ impl MysqlMcp {
         connection_id: Option<String>,
         commit: bool,
     ) -> CallToolResult {
+        let error_connection_id = connection_id.clone();
         let result = async {
             let session = self.sessions.get(connection_id.as_deref()).await?;
             let mut state = session.state.lock().await;
@@ -850,7 +919,8 @@ impl MysqlMcp {
             Ok::<_, anyhow::Error>(add_db(body, &identity, notice))
         }
         .await;
-        result.map(tool_ok).unwrap_or_else(tool_error)
+        self.complete_tool_result(result, error_connection_id.as_deref())
+            .await
     }
 
     async fn run_query_to_file(&self, args: QueryToFileArgs) -> anyhow::Result<Value> {
@@ -861,7 +931,7 @@ impl MysqlMcp {
             "format 仅支持 jsonl 或 csv"
         );
         let params = bind_params(args.params)?;
-        let (target, file) = AtomicTarget::create(&args.path, args.overwrite)?;
+        let (target, file) = AtomicTarget::create_async(&args.path, args.overwrite).await?;
         let session = self.sessions.get(args.connection_id.as_deref()).await?;
         let mut state = session.state.lock().await;
         let notice = session.reconnect_if_needed(&mut state).await?;
@@ -877,7 +947,7 @@ impl MysqlMcp {
             let mut rows = 0_u64;
             if format == "csv" {
                 let header = csv_record(names.iter().map(String::as_str))?;
-                writer.write_all(&header)?;
+                writer.write_all(&header).await?;
                 hasher.update(&header);
                 bytes += header.len() as u64;
             }
@@ -891,7 +961,7 @@ impl MysqlMcp {
                     let object = row.as_object().expect("row_to_json 必须返回对象");
                     csv_record(names.iter().map(|name| csv_cell(&object[name])))?
                 };
-                writer.write_all(&chunk)?;
+                writer.write_all(&chunk).await?;
                 hasher.update(&chunk);
                 bytes = bytes
                     .checked_add(chunk.len() as u64)
@@ -901,12 +971,12 @@ impl MysqlMcp {
                     .ok_or_else(|| anyhow::anyhow!("导出行数超出 u64"))?;
             }
             result.drop_result().await?;
-            writer.flush()?;
-            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            writer.flush().await?;
+            let file = writer.into_inner();
             Ok((file, rows, bytes, hex::encode(hasher.finalize())))
         })
         .await?;
-        let final_path = target.commit(output.0)?;
+        let final_path = target.commit_async(output.0).await?;
         state.last_used = Instant::now();
         Ok(add_db(
             json!({
@@ -977,10 +1047,22 @@ impl MysqlMcp {
             };
             selects.push(format!("SELECT {schema_col} AS database_name, '{kind}' AS object_type, {name_col} AS object_name FROM {source} WHERE {extra} AND (? IS NULL OR {schema_col} = ?) AND (? IS NULL OR {name_col} LIKE ?)"));
             params.extend([
-                database.clone().map(Value::String).unwrap_or(Value::Null),
-                database.clone().map(Value::String).unwrap_or(Value::Null),
-                name_like.clone().map(Value::String).unwrap_or(Value::Null),
-                name_like.clone().map(Value::String).unwrap_or(Value::Null),
+                database
+                    .clone()
+                    .map(ScalarParam::String)
+                    .unwrap_or(ScalarParam::Null(())),
+                database
+                    .clone()
+                    .map(ScalarParam::String)
+                    .unwrap_or(ScalarParam::Null(())),
+                name_like
+                    .clone()
+                    .map(ScalarParam::String)
+                    .unwrap_or(ScalarParam::Null(())),
+                name_like
+                    .clone()
+                    .map(ScalarParam::String)
+                    .unwrap_or(ScalarParam::Null(())),
             ]);
         }
         let sql = format!(
@@ -1013,7 +1095,7 @@ impl MysqlMcp {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         validate_export_paths(&paths)?;
-        std::fs::create_dir_all(&root)?;
+        tokio::fs::create_dir_all(&root).await?;
 
         let mut statuses = Vec::new();
         let mut last_identity = None;
@@ -1021,9 +1103,16 @@ impl MysqlMcp {
             let status = match self.fetch_ddl(object, args.connection_id.clone()).await {
                 Ok((ddl, identity, _)) => {
                     last_identity = Some(identity);
-                    match write_ddl(&path, &ddl, args.overwrite) {
-                        Ok(sha256) => {
-                            json!({"object": object, "ok": true, "path": path, "sha256": sha256})
+                    match write_ddl(&path, &ddl, args.overwrite).await {
+                        Ok(hashes) => {
+                            json!({
+                                "object": object,
+                                "ok": true,
+                                "path": path,
+                                "sha256": &hashes.file_sha256,
+                                "file_sha256": &hashes.file_sha256,
+                                "ddl_sha256": &hashes.ddl_sha256,
+                            })
                         }
                         Err(error) => {
                             json!({"object": object, "ok": false, "error": error.to_string()})
@@ -1068,20 +1157,29 @@ fn csv_record<T: AsRef<[u8]>>(values: impl IntoIterator<Item = T>) -> anyhow::Re
     Ok(writer.into_inner()?)
 }
 
-fn write_ddl(path: &Path, ddl: &str, overwrite: bool) -> anyhow::Result<String> {
+struct DdlHashes {
+    ddl_sha256: String,
+    file_sha256: String,
+}
+
+async fn write_ddl(path: &Path, ddl: &str, overwrite: bool) -> anyhow::Result<DdlHashes> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    let (target, mut file) = AtomicTarget::create(
-        path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("导出路径不是合法 UTF-8"))?,
-        overwrite,
-    )?;
-    file.write_all(ddl.as_bytes())?;
-    file.write_all(b"\n")?;
-    let sha256 = hex::encode(Sha256::digest(ddl.as_bytes()));
-    target.commit(file)?;
-    Ok(sha256)
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("导出路径不是合法 UTF-8"))?;
+    let (target, mut file) = AtomicTarget::create_async(path, overwrite).await?;
+    let mut file_contents = Vec::with_capacity(ddl.len() + 1);
+    file_contents.extend_from_slice(ddl.as_bytes());
+    file_contents.push(b'\n');
+    file.write_all(&file_contents).await?;
+    let hashes = DdlHashes {
+        ddl_sha256: hex::encode(Sha256::digest(ddl.as_bytes())),
+        file_sha256: hex::encode(Sha256::digest(&file_contents)),
+    };
+    target.commit_async(file).await?;
+    Ok(hashes)
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1095,12 +1193,26 @@ impl ServerHandler for MysqlMcp {
 
 #[cfg(test)]
 mod tests {
-    use super::limit_reason;
+    use super::{limit_reason, write_ddl};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn row_limit_takes_precedence_and_byte_limit_is_strict() {
         assert_eq!(limit_reason(200, 1, 1, 200, 32_768), Some("max_rows"));
         assert_eq!(limit_reason(1, 32_760, 9, 200, 32_768), Some("max_bytes"));
         assert_eq!(limit_reason(1, 32_760, 8, 200, 32_768), None);
+    }
+
+    #[tokio::test]
+    async fn exported_ddl_reports_content_and_file_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("demo.table.sql");
+        let ddl = "CREATE TABLE `demo` (`id` int)";
+        let hashes = write_ddl(&path, ddl, false).await.unwrap();
+        let file = tokio::fs::read(&path).await.unwrap();
+
+        assert_eq!(hashes.ddl_sha256, hex::encode(Sha256::digest(ddl)));
+        assert_eq!(hashes.file_sha256, hex::encode(Sha256::digest(&file)));
+        assert_ne!(hashes.ddl_sha256, hashes.file_sha256);
     }
 }
