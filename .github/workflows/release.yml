@@ -84,7 +84,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish GitHub Release
+    name: Publish Release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -109,4 +109,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TAG" \
-            --generate-notes
+            --notes "包含 Windows、Linux、macOS 安装包及 SHA-256 校验文件。版本变更请查看当前项目的标签比较页面。"

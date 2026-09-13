@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.88"
 description = "A precision-safe MySQL MCP server for database operations and object archiving"
 license = "MIT"
-repository = "https://github.com/sunfase-io/mysql-mcp-rs"
 
 [dependencies]
 anyhow = "1"

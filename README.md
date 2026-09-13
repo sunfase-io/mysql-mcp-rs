@@ -19,8 +19,10 @@
 
 要求 Rust 1.88+（edition 2024，`rmcp 3.1` 的最低版本）。
 
+将 `<当前项目 URL>` 替换为当前项目页面提供的克隆地址：
+
 ```bash
-git clone https://github.com/sunfase-io/mysql-mcp-rs
+git clone "<当前项目 URL>" mysql-mcp-rs
 cd mysql-mcp-rs
 cargo build --release
 ```
@@ -38,7 +40,7 @@ cargo build --release
 
 手动触发时，工作流会在当前 `main` 提交上创建对应 tag 和 Release。Release 资产不可变；若 tag 已存在，必须改用新的版本号。
 
-发布版本可从 [公开仓库 Release](https://github.com/sunfase-io/mysql-mcp-rs/releases) 或 [内网仓库 Release](http://10.99.186.14/huchangying/mysql-mcp-rs/-/releases) 下载。内网 Release 同步相同版本的压缩包与 SHA-256 校验文件。
+发布版本可从当前项目的 Release 页面下载，包含各平台压缩包与 SHA-256 校验文件。
 
 服务通过 stdio 使用 MCP 协议；数据库密码只保存在进程内存，不写配置、不回显、不记录日志。
 
