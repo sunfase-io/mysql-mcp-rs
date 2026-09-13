@@ -30,18 +30,15 @@ cargo build --release
 - Windows：`target/release/mysql-mcp.exe`
 - macOS / Linux：`target/release/mysql-mcp`
 
-### GitHub 自动发布
+### 自动发布
 
-仓库的 `Release` 工作流由 GitHub 托管的 Windows、Linux、macOS runner 编译并上传压缩包与 SHA-256 校验文件，本机不需要预编译或上传二进制。
+仓库的 `Release` 工作流在 CI 中编译 Windows、Linux、macOS 版本，并上传压缩包与 SHA-256 校验文件，本机不需要预编译或上传二进制。
 
-推送 `v*` 标签会自动发布，也可以使用 GitHub CLI 手动触发：
-
-```bash
-gh workflow run release.yml -f tag=v0.1.0
-gh run watch --exit-status
-```
+推送 `v*` 标签会自动发布，也可以在 CI 中手动触发 `Release` 工作流并指定版本标签（如 `v0.1.2`）。
 
 手动触发时，工作流会在当前 `main` 提交上创建对应 tag 和 Release。Release 资产不可变；若 tag 已存在，必须改用新的版本号。
+
+发布版本可从 [公开仓库 Release](https://github.com/sunfase-io/mysql-mcp-rs/releases) 或 [内网仓库 Release](http://10.99.186.14/huchangying/mysql-mcp-rs/-/releases) 下载。内网 Release 同步相同版本的压缩包与 SHA-256 校验文件。
 
 服务通过 stdio 使用 MCP 协议；数据库密码只保存在进程内存，不写配置、不回显、不记录日志。
 
@@ -66,6 +63,7 @@ CC-SWITCH 示例（路径请按本机实际位置修改）：
 
 ```json
 {
+  "type": "stdio",
   "command": "D:/RustroverProjects/mysql-mcp/target/release/mysql-mcp.exe"
 }
 ```
